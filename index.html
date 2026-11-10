@@ -334,9 +334,18 @@ body.busy .apanel{visibility:hidden}
 <div id="fx" class="fx" aria-hidden="true"></div>
 <div id="toast" class="toast" hidden></div>
 
-<script src="https://unpkg.com/peerjs@1.5.4/dist/peerjs.min.js"></script>
+<script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-app-compat.js"></script>
+<script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-database-compat.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/qrcodejs/1.0.0/qrcode.min.js"></script>
 <script>
+"use strict";
+/* ====== À REMPLIR : l'adresse de ta base Firebase (page Realtime Database) ======
+   Tu peux reprendre exactement la même adresse que pour Time Bomb. */
+const FIREBASE_CONFIG = {
+  databaseURL: "https://dernier-fil-default-rtdb.europe-west1.firebasedatabase.app/"
+};
+/* ================================================================================ */
+
 const CARD=[
   {v:0,n:'Espionne',a:"l'Espionne",k:2,fx:"Aucun effet en la jouant. En fin de manche, si tu es le seul joueur encore en jeu à avoir joué ou défaussé une Espionne, tu marques une victoire."},
   {v:1,n:'Garde',a:'le Garde',k:6,fx:"Désigne un autre joueur et nomme une carte autre que le Garde. S'il l'a en main, il est éliminé de la manche."},
@@ -371,8 +380,7 @@ const BOT_NAMES=['Orion','Vega','Lynx','Atlas','Nova','Iris','Sirius','Opale'];
 const $=id=>document.getElementById(id);
 const REDUCE=(()=>{try{return matchMedia('(prefers-reduced-motion: reduce)').matches}catch(e){return false}})();
 
-const PREFIX='pli-scelle-';
-let peer=null,hostConn=null,conns=new Map(),code=null,mode='home',netOk=false,qrUrl=null,guestMsg='',retryT=null,hostTries=0;
+let fdb=null,roomRef=null,onlineRef=null,meOnline=null,code=null,mode='home',netOk=false,qrUrl=null,guestMsg='',gen=0;
 let S=null,V=null,loaded=false,pid=null,isEngine=false,fatal=null;
 let myName='';
 let online=new Set();
@@ -685,8 +693,16 @@ function fxMs(f){
   return 2100+extra;
 }
 let botTimer=null,botKey='';
+/* bots are played by one browser only: the host's, or the first player still online if the host has left */
+function botRunner(s){
+  if(!s)return null;
+  if(online.has(s.hostPid))return s.hostPid;
+  const on=s.players.filter(p=>!p.bot&&online.has(p.pid)).map(p=>p.pid).sort();
+  return on[0]||s.hostPid;
+}
+function updEngine(){const was=isEngine;isEngine=!!S&&botRunner(S)===pid;if(isEngine&&!was){botKey='';botTick()}}
 function botTick(){
-  if(!isEngine||!S||S.phase!=='play')return;
+  if(!isEngine||!S||S.phase!=='play'||!roomRef)return;
   const who=S.pending?S.pending.pid:S.turn;
   const p=S.players.find(x=>x.pid===who);
   if(!p||!p.bot)return;
@@ -695,39 +711,31 @@ function botTick(){
   botKey=key;clearTimeout(botTimer);
   const lastFx=(S.fx||[])[S.fx.length-1];
   const delay=(REDUCE?300:fxMs(lastFx))+500+rand(600);
+  const ts=S.ts,my=gen;
   botTimer=setTimeout(()=>{
     botTimer=null;
-    if(!isEngine||!S||S.gid+'|'+S.ts!==key)return;
-    const next=structuredClone(S);
-    let act=botMove(next,who);
-    if(!act||!applyAct(next,who,act)){
-      const alt=structuredClone(S);const ops=(S.pending||!S.drawn)?[botMove(alt,who)]:legalMoves(alt,who);
-      act=ops.length?ops[rand(ops.length)]:null;
-      if(!act||!applyAct(alt,who,act))return;
-      alt.ts=Date.now();commit(alt);return;
-    }
-    next.ts=Date.now();commit(next);
+    if(!roomRef||gen!==my||!S||S.ts!==ts)return;
+    roomRef.transaction(cur=>{
+      const s=readRoom(cur);if(!s||s.ts!==ts||s.phase!=='play')return;
+      if((s.pending?s.pending.pid:s.turn)!==who)return;
+      let act=botMove(structuredClone(s),who);
+      if(!act||!applyAct(s,who,act)){
+        const alt=(s.pending||!s.drawn)?[]:legalMoves(s,who);
+        act=alt.length?alt[rand(alt.length)]:null;
+        if(!act||!applyAct(s,who,act))return;
+      }
+      return packRoom(s);
+    },(err,ok)=>{if(err&&gen===my){botKey='';setTimeout(botTick,2000)}},false);
   },delay);
 }
 
-function onAct(a,act){
-  if(!isEngine||!S||!a||!act||typeof act!=='object')return;
-  if(act.g!==S.gid)return;
-  const seq=+act.seq||0,key=a+'|'+S.gid;
-  if(seq<=((S.lastSeq||{})[a]||0)||seq<=(done.get(key)||0))return;
-  done.set(key,seq);
-  const next=structuredClone(S);next.lastSeq=next.lastSeq||{};
-  if(applyAct(next,a,act)){next.lastSeq[a]=seq;next.ts=Date.now();commit(next)}
-}
-let chain=null;
-function commit(next){
-  const prev=S;S=next;afterState(prev);showState();broadcast();
-  if(mode==='host')lsSet('ps_host',JSON.stringify({code,state:S}));
-}
-
-/* ---------- online play with PeerJS: the host's browser holds the table ---------- */
+/* ---------- online play through Firebase, like Time Bomb ----------
+   The whole table lives in rooms/<code> as one JSON text; every move is a transaction. */
+function readRoom(v){if(!v||typeof v.s!=='string')return null;try{return JSON.parse(v.s)}catch(e){return null}}
+function packRoom(s){s.ts=Date.now();return {s:JSON.stringify(s),ts:s.ts}}
 function newCode(){const a='ABCDEFGHJKLMNPQRSTUVWXYZ23456789';const r=crypto.getRandomValues(new Uint32Array(5));let s='';for(const x of r)s+=a[x%a.length];return s}
-function joinUrl(){return location.origin+location.pathname+'?salle='+code}
+function joinUrl(){return location.origin+location.pathname+'#'+code}
+function readHash(){const h=decodeURIComponent(location.hash.slice(1)).toUpperCase().replace(/[^A-Z0-9]/g,'');return /^[A-Z0-9]{4,8}$/.test(h)?h:null}
 function makeQR(){
   qrUrl=null;
   try{
@@ -737,109 +745,78 @@ function makeQR(){
     const cv=tmp.querySelector('canvas');qrUrl=cv?cv.toDataURL('image/png'):null;
   }catch(e){qrUrl=null}
 }
-/* each guest only receives what their seat may see */
-function viewFor(s,p){
-  const v=structuredClone(s);
-  for(const q in v.hands)if(q!==p)v.hands[q]=v.hands[q].map(c=>({id:c.id,v:null}));
-  v.deck=(v.deck||[]).map(()=>0);v.aside=null;v.discards={};v.lastSeq={};
-  v.privs=(v.privs||[]).filter(x=>x.to===p);
-  return v;
+function openRoom(c){
+  gen++;const my=gen;
+  if(roomRef){roomRef.off();roomRef=null}
+  if(onlineRef){onlineRef.off();onlineRef=null}
+  if(meOnline){try{meOnline.onDisconnect().cancel();meOnline.remove()}catch(e){}meOnline=null}
+  clearTimeout(botTimer);botKey='';
+  S=null;V=null;online=new Set();isEngine=false;guestMsg='';ui.pending=null;
+  ui.createOpen=false;ui.askClose=false;ui.showQR=false;ui.askQuit=false;ui.askRestart=false;ui.sel=null;ui.keep=null;
+  code=c;mode=c?'room':'home';loaded=!c;
+  if(!c||!fdb){render();return}
+  makeQR();
+  roomRef=fdb.ref('rooms/'+c);
+  const timer=setTimeout(()=>{if(gen===my&&!loaded){guestMsg='La table met du temps à répondre. Vérifie ta connexion internet.';render()}},10000);
+  let seen=false;
+  roomRef.on('value',snap=>{
+    if(gen!==my)return;clearTimeout(timer);
+    const st=readRoom(snap.val());
+    if(!st){
+      if(seen){toast("L'hôte a fermé la salle.");location.hash='';return}
+      loaded=true;guestMsg=`Aucune partie ouverte avec le code ${c}. Vérifie le code auprès de l'hôte.`;render();return;
+    }
+    seen=true;loaded=true;onState(st);
+  },()=>{if(gen!==my)return;loaded=true;fatal="Accès à la base refusé. Vérifie les règles de sécurité Firebase.";render()});
+  onlineRef=fdb.ref('online/'+c);
+  onlineRef.on('value',snap=>{if(gen!==my)return;online=new Set(Object.keys(snap.val()||{}));updEngine();render()},()=>{});
+  meOnline=fdb.ref('online/'+c+'/'+pid);
+  if(netOk){meOnline.onDisconnect().remove();meOnline.set(true)}
+  render();
 }
-function sendTo(c){const p=conns.get(c);if(!p||!S||!c.open)return;try{c.send({state:viewFor(S,p),online:[...online]})}catch(e){}}
-function broadcast(){if(mode!=='host')return;for(const c of conns.keys())sendTo(c)}
-function updOnline(){online=new Set([pid,...conns.values()]);broadcast();render()}
-function hostPeer(){
-  if(!window.Peer){netOk=false;toast("Connexion en ligne indisponible : tu peux quand même jouer contre des bots.");render();return}
-  try{if(peer)peer.destroy()}catch(e){}
-  netOk=false;
-  const pr=new Peer(PREFIX+code.toLowerCase());peer=pr;
-  pr.on('open',()=>{if(peer!==pr)return;netOk=true;hostTries=0;render()});
-  pr.on('connection',c=>{
-    c.on('data',m=>onGuestMsg(c,m));
-    c.on('close',()=>{conns.delete(c);updOnline()});
-    c.on('error',()=>{conns.delete(c);updOnline()});
-  });
-  pr.on('disconnected',()=>{if(peer!==pr)return;netOk=false;render();setTimeout(()=>{try{if(peer===pr&&!pr.destroyed)pr.reconnect()}catch(e){}},2000)});
-  pr.on('error',err=>{
-    if(peer!==pr)return;
-    netOk=false;render();
-    const t=err&&err.type;
-    if(t==='unavailable-id'){hostTries++;setTimeout(()=>{if(mode==='host'&&peer===pr)hostPeer()},hostTries<8?4000:8000);return}
-    if(['network','server-error','socket-error','socket-closed'].includes(t))setTimeout(()=>{try{if(mode==='host'&&peer===pr&&!pr.destroyed&&pr.disconnected)pr.reconnect()}catch(e){}},4000);
-  });
-}
-function onGuestMsg(c,m){
-  if(!m||typeof m!=='object')return;
-  if(m.hello){const p=String(m.hello.pid||'').slice(0,48);if(!p)return;conns.set(c,p);updOnline();sendTo(c);return}
-  const p=conns.get(c);if(p&&m.act)onAct(p,m.act);
-}
-function connectGuest(){
-  if(mode!=='guest')return;
-  if(!window.Peer){fatal="Le module de connexion n'a pas pu se charger. Vérifie ta connexion internet puis recharge la page.";render();return}
-  if(!peer||peer.destroyed){
-    const pr=new Peer();peer=pr;
-    pr.on('open',()=>{if(peer===pr)openConn()});
-    pr.on('disconnected',()=>{try{if(peer===pr&&!pr.destroyed)pr.reconnect()}catch(e){}});
-    pr.on('error',err=>{
-      if(peer!==pr)return;netOk=false;
-      guestMsg=err&&err.type==='peer-unavailable'?`Aucune partie ouverte avec le code ${code} pour l'instant. Nouvel essai dans quelques secondes…`:'Connexion difficile, nouvel essai dans quelques secondes…';
-      render();retry();
-    });
-  }else if(peer.open)openConn();
-}
-function openConn(){
-  try{if(hostConn)hostConn.close()}catch(e){}
-  const c=peer.connect(PREFIX+code.toLowerCase(),{reliable:true});hostConn=c;
-  c.on('open',()=>{if(hostConn!==c)return;netOk=true;guestMsg='';try{c.send({hello:{pid,name:myName}})}catch(e){}render()});
-  c.on('data',m=>{
-    if(hostConn!==c||!m||typeof m!=='object')return;
-    if(m.closed){leaveRoom("L'hôte a fermé la salle.");return}
-    if(m.state){online=new Set(m.online||[]);loaded=true;onState(m.state)}
-  });
-  c.on('close',()=>{if(hostConn===c){netOk=false;render();retry()}});
-}
-function retry(){
-  clearTimeout(retryT);
-  retryT=setTimeout(()=>{if(mode!=='guest')return;if(peer&&peer.open&&!peer.destroyed)openConn();else{try{peer&&peer.destroy()}catch(e){}peer=null;connectGuest()}},3000);
-}
-function joinRoom(raw){
-  const c=String(raw||'').toUpperCase().replace(/[^A-Z0-9]/g,'').slice(0,5);if(c.length!==5)return false;
-  code=c;mode='guest';loaded=false;S=null;V=null;fatal=null;guestMsg='';isEngine=false;
-  try{history.replaceState(null,'','?salle='+code)}catch(e){}
-  makeQR();connectGuest();render();return true;
-}
-function leaveRoom(msg){
-  if(mode==='host'){for(const c of conns.keys()){try{c.send({closed:true})}catch(e){}}lsSet('ps_host','')}
-  clearTimeout(retryT);
-  const p=peer;setTimeout(()=>{try{p&&p.destroy()}catch(e){}},400);
-  peer=null;hostConn=null;conns=new Map();online=new Set();
-  mode='home';code=null;S=null;V=null;loaded=true;isEngine=false;netOk=false;qrUrl=null;fatal=null;
-  ui.createOpen=false;ui.askClose=false;ui.showQR=false;ui.askQuit=false;
-  try{history.replaceState(null,'',location.pathname)}catch(e){}
-  render();if(msg)toast(msg);
+function leaveRoom(msg){if(location.hash&&location.hash!=='#')location.hash='';else openRoom(null);if(msg)toast(msg)}
+function closeRoom(){
+  const r=roomRef,c=code;
+  if(r)r.remove().catch(()=>{});
+  if(fdb&&c)fdb.ref('online/'+c).remove().catch(()=>{});
+  leaveRoom('Salle fermée.');
 }
 
 /* ---------- player actions ---------- */
 function send(type,extra){
-  if(!S)return;
-  const act=Object.assign({type},extra||{},{g:S.gid,seq:Date.now()});
-  if(mode==='host'){onAct(pid,act);return}
-  if(!(hostConn&&hostConn.open)){toast("Connexion à l'hôte perdue, nouvel essai en cours.");retry();return}
-  try{hostConn.send({act})}catch(e){}
-  ui.pending={type,at:Date.now(),ts:S.ts};
-  setTimeout(render,8500);
+  if(!roomRef||!S)return;
+  if(ui.pending&&Date.now()-ui.pending.at<6000)return;
+  const act=Object.assign({type},extra||{},{g:S.gid});
+  ui.pending={type,at:Date.now(),ts:S.ts};render();
+  const my=gen;
+  roomRef.transaction(cur=>{
+    const s=readRoom(cur);if(!s)return;
+    if(act.g!==s.gid)return;
+    if(!applyAct(s,pid,act))return;
+    return packRoom(s);
+  },(err,committed)=>{
+    if(gen!==my)return;
+    ui.pending=null;
+    if(err)toast(netOk?"L'action n'est pas passée. Réessaie.":"Pas de connexion. Vérifie ton réseau.");
+    else if(!committed&&type==='play')toast("Ce coup n'est plus possible.");
+    render();
+  },false);
 }
 function createGame(){
   const size=ui.size;
-  if(mode==='host'&&S){onAct(pid,{type:'lobby',size,g:S.gid,seq:Date.now()});ui.createOpen=false;ui.confirm=false;render();return}
+  if(mode==='room'&&S&&S.hostPid===pid){ui.createOpen=false;ui.confirm=false;send('lobby',{size});return}
+  if(!fdb){toast("Le site n'est pas relié à sa base de données.");return}
   const n=cleanName($('hostName').value||myName);
   if(!n){$('hostErr').hidden=false;return}
   myName=n;lsSet('ps_name',n);$('name').value=n;
-  code=newCode();mode='host';isEngine=true;loaded=true;fatal=null;hostTries=0;online=new Set([pid]);
-  ui.createOpen=false;ui.confirm=false;
-  try{history.replaceState(null,'',location.pathname)}catch(e){}
-  makeQR();hostPeer();
-  commit(freshLobby(size,pid,[{pid,name:n}]));
+  const c=newCode();const s=freshLobby(size,pid,[{pid,name:n}]);
+  $('createBtn').disabled=true;
+  fdb.ref('rooms/'+c).transaction(cur=>cur===null?packRoom(s):undefined,(err,ok)=>{
+    $('createBtn').disabled=false;
+    if(err){toast("La partie n'a pas pu être créée. Vérifie ta connexion.");return}
+    if(!ok){createGame();return}
+    ui.createOpen=false;location.hash=c;
+  },false);
 }
 
 /* ---------- card markup ---------- */
@@ -904,7 +881,7 @@ function intelHtml(D){
 let busy=false,dirty=false;
 function render(){
   botTick();
-  const st=fatal?'Hors ligne':mode==='host'?(netOk?'Hôte · salle ouverte':'Hôte · ouverture de la salle…'):mode==='guest'?(netOk?'Connecté à l\'hôte':'Connexion…'):'Accueil';
+  const st=fatal?'Hors ligne':!netOk?'Connexion à la base…':mode==='room'?'En ligne':'Accueil';
   $('net').className='net'+(netOk&&!fatal?' on':'');$('net').title=st;$('net').setAttribute('aria-label',st);
   if(busy){dirty=true;return}
   const D=V||S;
@@ -915,7 +892,7 @@ function render(){
   $('table').hidden=!inGame;$('col').hidden=inGame;
   $('log').innerHTML=D&&D.log&&D.log.length?D.log.slice(-14).reverse().map(e=>{const t=logText(e);return t?`<li><span>${t}</span></li>`:''}).join(''):`<li><span>Rien pour l'instant.</span></li>`;
 
-  const showCreate=!fatal&&(mode==='home'||(mode==='host'&&ui.createOpen));
+  const showCreate=!fatal&&(mode==='home'||(isHost&&ui.createOpen));
   $('createBox').hidden=!showCreate;
   $('hostNameRow').hidden=mode!=='home';
   $('homeJoin').hidden=!(mode==='home'&&!fatal);
@@ -938,9 +915,9 @@ function render(){
     board.innerHTML='';return;
   }
   const stalled=ui.pending&&Date.now()-ui.pending.at>8000&&ui.pending.ts===S.ts;
-  const stallNote=stalled?`<p class="notice">Ton action n'a pas encore été prise en compte. Le téléphone de l'hôte doit rester ouvert sur cette page.</p>`:'';
+  const stallNote=stalled?`<p class="notice">Ton action n'est pas encore passée. Vérifie ta connexion internet.</p>`:'';
   const hasBots=D.players.some(p=>p.bot);
-  const hostNote=mode==='host'?`<p class="notice">Garde cette page ouverte et ton écran allumé : ton téléphone héberge la partie${hasBots?' et fait jouer les bots':''}.</p>`:'';
+  const hostNote=isEngine&&hasBots&&D.phase!=='lobby'?`<p class="notice">Garde cette page ouverte : c'est ton téléphone qui fait jouer les bots.</p>`:'';
 
   if(inGame){renderTable(D,stallNote,hostNote,isHost);head.innerHTML='';board.innerHTML='';return}
   if(D.phase==='play'){head.innerHTML='';board.innerHTML='';return}
@@ -1066,7 +1043,7 @@ function renderTable(D,stallNote,hostNote,isHost){
     }
   }
   const humans=D.players.filter(p=>!p.bot&&p.pid!==D.hostPid);
-  const hostH=isHost||me||mode==='guest'?`<details class="hostmenu"><summary>Gérer la partie</summary><div class="in">
+  const hostH=isHost||me||mode==='room'?`<details class="hostmenu"><summary>Gérer la partie</summary><div class="in">
       ${isHost?(humans.map(p=>`<div class="rp"><b>${esc(p.name)}</b><span class="muted">→ bot</span>${[1,2,3].map(l=>`<button class="chip" data-act="botify" data-pid="${esc(p.pid)}" data-l="${l}">${LVL[l].n}</button>`).join('')}</div>`).join('')||'<p class="muted">Aucun autre joueur humain à remplacer.</p>'):''}
       ${isHost?(ui.askRestart?`<p class="notice">La partie en cours sera perdue et les victoires remises à zéro.</p><div class="row"><button class="btn primary grow" data-act="restart">Confirmer</button><button class="btn ghost" data-act="norestart">Annuler</button></div>`:`<button class="btn small ghost" data-act="askrestart">Recommencer la partie</button>`):''}
       ${code?`${ui.showQR?qrPanel():''}<button class="btn small" data-act="qr">${ui.showQR?'Masquer le QR code':'Afficher le QR code pour inviter'}</button>`:''}
@@ -1386,7 +1363,7 @@ document.addEventListener('click',e=>{
     case 'home':leaveRoom();return;
     case 'askclose':ui.askClose=true;break;
     case 'noclose':ui.askClose=false;break;
-    case 'closeroom':ui.askClose=false;leaveRoom();return;
+    case 'closeroom':ui.askClose=false;closeRoom();return;
     case 'qr':ui.showQR=!ui.showQR;break;
     case 'copylink':{const u=joinUrl();try{navigator.clipboard.writeText(u).then(()=>toast('Lien copié'),()=>toast(u))}catch(err){toast(u)}break}
     case 'quit':{ui.askQuit=false;ui.createOpen=false;const D=V||S;if(D&&D.hostPid===pid)send('lobby',{size:clampSize(D.size)});else send('quit');break}
@@ -1410,12 +1387,11 @@ $('joinBtn').onclick=()=>{
   const n=cleanName($('name').value);
   if(!n){$('nameErr').hidden=false;return}
   myName=n;lsSet('ps_name',n);
-  if(hostConn&&hostConn.open){try{hostConn.send({hello:{pid,name:n}})}catch(e){}}
   send('join',{name:n});render();
 };
 $('joinCode').addEventListener('input',()=>{$('codeErr').hidden=true});
 $('joinCode').addEventListener('keydown',e=>{if(e.key==='Enter')$('joinCodeBtn').click()});
-$('joinCodeBtn').onclick=()=>{if(!joinRoom($('joinCode').value))$('codeErr').hidden=false};
+$('joinCodeBtn').onclick=()=>{const c=$('joinCode').value.toUpperCase().replace(/[^A-Z0-9]/g,'');if(c.length<4){$('codeErr').hidden=false;return}location.hash=c};
 $('hostName').addEventListener('input',()=>{$('hostErr').hidden=true});
 $('hostName').addEventListener('keydown',e=>{if(e.key==='Enter')$('createBtn').click()});
 $('ref').innerHTML=CARD.map(c=>`<li>${cardHTML(c.v)}<div class="t"><b>${c.v} · ${esc(c.n)}</b> <span class="muted">× ${c.k}</span><br>${esc(c.fx)}</div></li>`).join('');
@@ -1423,7 +1399,7 @@ $('ref').innerHTML=CARD.map(c=>`<li>${cardHTML(c.v)}<div class="t"><b>${c.v} · 
 let wl=null;
 async function wake(){try{if(!wl&&navigator.wakeLock&&document.visibilityState==='visible'&&S&&S.phase!=='end'){wl=await navigator.wakeLock.request('screen');wl.addEventListener('release',()=>{wl=null})}}catch(e){}}
 document.addEventListener('pointerup',wake);
-document.addEventListener('visibilitychange',()=>{if(document.visibilityState==='visible'){wake();if(mode==='guest'&&!(hostConn&&hostConn.open))retry()}});
+document.addEventListener('visibilitychange',()=>{if(document.visibilityState==='visible')wake()});
 
 function afterState(prev){
   if(!S)return;
@@ -1436,24 +1412,28 @@ function afterState(prev){
   const meP=S.players.find(p=>p.pid===pid);if(meP&&!myName)myName=meP.name;
 }
 function onState(d){
-  const prev=S;S=d?structuredClone(d):null;
-  afterState(prev);showState();
+  const prev=S;S=d||null;
+  afterState(prev);updEngine();showState();
 }
 
 /* ---------- boot ---------- */
 function boot(){
   myName=cleanName(lsGet('ps_name')||'');$('name').value=myName;$('hostName').value=myName;
-  pid=lsGet('ps_pid');if(!pid){pid='g-'+rid(10);lsSet('ps_pid',pid)}
+  pid=lsGet('ps_pid');if(!pid){pid='p'+rid(11);lsSet('ps_pid',pid)}
   loaded=true;
-  const q=(new URLSearchParams(location.search).get('salle')||'').toUpperCase();
-  let saved=null;try{const raw=lsGet('ps_host');saved=raw?JSON.parse(raw):null}catch(e){saved=null}
-  if(saved&&saved.code&&saved.state&&saved.state.hostPid===pid&&(!q||q===saved.code)){
-    code=saved.code;mode='host';isEngine=true;S=saved.state;V=S;online=new Set([pid]);
-    makeQR();hostPeer();render();
-    toast('Partie restaurée : les autres joueurs se reconnectent tout seuls.');return;
+  if(!window.firebase||!/^https:\/\/.+/.test(FIREBASE_CONFIG.databaseURL||'')){
+    fatal="Le site n'est pas encore relié à sa base de données. Colle l'adresse de ta base Firebase en haut du script (la même que pour Time Bomb convient).";
+    render();return;
   }
-  if(q&&joinRoom(q))return;
-  render();
+  try{firebase.initializeApp(FIREBASE_CONFIG);fdb=firebase.database()}
+  catch(e){fatal="L'adresse de la base Firebase est invalide.";render();return}
+  fdb.ref('.info/connected').on('value',snap=>{
+    netOk=!!snap.val();
+    if(netOk&&meOnline){meOnline.onDisconnect().remove();meOnline.set(true)}
+    render();
+  });
+  window.addEventListener('hashchange',()=>{const c=readHash();if(c!==code)openRoom(c)});
+  openRoom(readHash());
 }
 boot();
 </script>
